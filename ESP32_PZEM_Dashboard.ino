@@ -40,6 +40,8 @@ char lastTime[9] = "00:00:00";
 
 String simLastMessage = "Aucun message";
 String simLastSender = "";
+bool simNetworkConnected = false;
+String simNetworkStatus = "Non connecte au reseau";
 
 unsigned long lastSampleMs = 0;
 unsigned long lastSimPollMs = 0;
@@ -121,18 +123,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       <div class="label">📶 SIM800</div>
       <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
         <div>
-          <div class="label">Dernier SMS reçu</div>
-          <textarea id="lastSms" rows="3" class="input" style="height:auto;padding:10px;resize:vertical;" readonly>Aucun message</textarea>
-        </div>
-        <div>
-          <div class="label">Numéro (appel / SMS)</div>
-          <input id="phoneNumber" type="text" class="input" placeholder="+213XXXXXXXXX" />
-          <div class="label" style="margin-top:8px;">Message SMS</div>
-          <input id="smsBody" type="text" class="input" placeholder="Votre message" />
-          <div style="display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;">
-            <button id="callBtn" class="btn" style="background:#14b8a6;">Appeler</button>
-            <button id="smsBtn" class="btn" style="background:#6366f1;">Envoyer SMS</button>
-          </div>
+          <div class="label">État réseau</div>
+          <div id="simStatus" class="value" style="font-size:1.2rem;">Non connecté au réseau</div>
         </div>
       </div>
     </section>
@@ -149,9 +141,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const powerEl = document.getElementById('power');
     const energyEl = document.getElementById('energy');
     const relayAllSwitch = document.getElementById('relayAllSwitch');
-    const lastSmsEl = document.getElementById('lastSms');
-    const phoneNumberEl = document.getElementById('phoneNumber');
-    const smsBodyEl = document.getElementById('smsBody');
+    const simStatusEl = document.getElementById('simStatus');
 
     function updateUI(data) {
       if (typeof data.voltage === 'number') voltageEl.innerHTML = `${data.voltage.toFixed(2)}<span class="unit">V</span>`;
@@ -159,9 +149,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (typeof data.power === 'number') powerEl.innerHTML = `${data.power.toFixed(1)}<span class="unit">W</span>`;
       if (typeof data.energy === 'number') energyEl.innerHTML = `${data.energy.toFixed(3)}<span class="unit">kWh</span>`;
       if (typeof data.relay1 === 'boolean' && typeof data.relay2 === 'boolean') relayAllSwitch.checked = data.relay1 && data.relay2;
-      if (typeof data.simLastMessage === 'string') {
-        const from = typeof data.simLastSender === 'string' && data.simLastSender.length ? `De ${data.simLastSender}\n` : '';
-        lastSmsEl.value = `${from}${data.simLastMessage}`;
+      if (typeof data.simNetworkStatus === 'string') {
+        simStatusEl.textContent = data.simNetworkStatus;
+        simStatusEl.style.color = data.simNetworkConnected ? '#22c55e' : '#ef4444';
       }
     }
 
@@ -182,22 +172,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       updateUI(await res.json());
     }
 
-    async function sendCall() {
-      const number = encodeURIComponent(phoneNumberEl.value.trim());
-      if (!number) return;
-      await fetch(`/sim/call?number=${number}`);
-    }
-
-    async function sendSms() {
-      const number = encodeURIComponent(phoneNumberEl.value.trim());
-      const message = encodeURIComponent(smsBodyEl.value.trim());
-      if (!number || !message) return;
-      await fetch(`/sim/sms?number=${number}&message=${message}`);
-    }
-
     relayAllSwitch.addEventListener('change', (e) => setAllRelays(e.target.checked));
-    document.getElementById('callBtn').addEventListener('click', sendCall);
-    document.getElementById('smsBtn').addEventListener('click', sendSms);
     connectWS();
   </script>
 </body>
@@ -290,6 +265,14 @@ void updateLatestSimMessage() {
   }
 }
 
+void updateSimNetworkStatus() {
+  const String regResp = sendSimCommand("AT+CREG?", 1200);
+  const bool registeredHome = regResp.indexOf("+CREG: 0,1") >= 0 || regResp.indexOf("+CREG: 1,1") >= 0;
+  const bool registeredRoaming = regResp.indexOf("+CREG: 0,5") >= 0 || regResp.indexOf("+CREG: 1,5") >= 0;
+  simNetworkConnected = registeredHome || registeredRoaming;
+  simNetworkStatus = simNetworkConnected ? "Connecte au reseau" : "Non connecte au reseau";
+}
+
 void initSim800() {
   sim800.begin(9600, SERIAL_8N1, SIM800_RX_PIN, SIM800_TX_PIN);
   sendSimCommand("AT");
@@ -297,6 +280,7 @@ void initSim800() {
   sendSimCommand("AT+CMGF=1");
   sendSimCommand("AT+CPMS=\"SM\",\"SM\",\"SM\"");
   sendSimCommand("AT+CNMI=1,1,0,0,0");
+  updateSimNetworkStatus();
   updateLatestSimMessage();
 }
 
@@ -339,10 +323,11 @@ String buildCurrentJson() {
   const String safeFrom = sanitizeJson(simLastSender);
   char payload[520];
   snprintf(payload, sizeof(payload),
-           "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.1f,\"energy\":%.3f,\"time\":\"%s\",\"relay1\":%s,\"relay2\":%s,\"simLastMessage\":\"%s\",\"simLastSender\":\"%s\"}",
+           "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.1f,\"energy\":%.3f,\"time\":\"%s\",\"relay1\":%s,\"relay2\":%s,\"simLastMessage\":\"%s\",\"simLastSender\":\"%s\",\"simNetworkConnected\":%s,\"simNetworkStatus\":\"%s\"}",
            lastVoltage, lastCurrent, lastPower, lastEnergy, lastTime,
            relay1State ? "true" : "false", relay2State ? "true" : "false",
-           safeMsg.c_str(), safeFrom.c_str());
+           safeMsg.c_str(), safeFrom.c_str(),
+           simNetworkConnected ? "true" : "false", sanitizeJson(simNetworkStatus).c_str());
   return String(payload);
 }
 
@@ -418,6 +403,7 @@ void setup() {
   });
 
   server.on("/sim/status", HTTP_GET, [](AsyncWebServerRequest* request) {
+    updateSimNetworkStatus();
     updateLatestSimMessage();
     request->send(200, "application/json", buildCurrentJson());
   });
@@ -451,6 +437,7 @@ void loop() {
 
   if (nowMs - lastSimPollMs >= SIM_POLL_INTERVAL_MS) {
     lastSimPollMs = nowMs;
+    updateSimNetworkStatus();
     updateLatestSimMessage();
     notifyClients();
   }
