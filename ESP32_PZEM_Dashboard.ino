@@ -157,8 +157,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       font-size: clamp(1.5rem, 4.3vw, 2.2rem);
       font-weight: 700;
       line-height: 1.1;
-      transition: transform 0.22s ease, color 0.22s ease;
-      will-change: transform;
+      transition: color 0.18s ease;
     }
 
     .unit {
@@ -168,37 +167,70 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       font-weight: 500;
     }
 
-    .pulse {
-      transform: scale(1.03);
-      color: var(--accent);
-    }
-
     .toolbar {
       display: flex;
       gap: 10px;
       flex-wrap: wrap;
     }
 
-    button {
+    .relay-control {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      border-radius: 12px;
       border: 1px solid var(--border);
-      background: #1f2937;
-      color: var(--text);
-      padding: 10px 14px;
-      border-radius: 10px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s ease;
+      background: #111827;
     }
 
-    button:hover {
-      border-color: rgba(129,140,248,0.65);
-      transform: translateY(-1px);
-    }
-
-    .relay-state {
-      color: var(--muted);
+    .relay-label {
       font-size: 0.92rem;
-      align-self: center;
+      color: var(--text);
+      font-weight: 600;
+      min-width: 120px;
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 52px;
+      height: 28px;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .slider {
+      position: absolute;
+      cursor: pointer;
+      inset: 0;
+      background-color: #374151;
+      transition: .2s;
+      border-radius: 999px;
+      border: 1px solid rgba(255,255,255,0.08);
+    }
+
+    .slider:before {
+      position: absolute;
+      content: "";
+      height: 20px;
+      width: 20px;
+      left: 3px;
+      top: 3px;
+      background: #f8fafc;
+      transition: .2s;
+      border-radius: 50%;
+    }
+
+    .switch input:checked + .slider {
+      background-color: #14b8a6;
+    }
+
+    .switch input:checked + .slider:before {
+      transform: translateX(24px);
     }
 
     .footer-note {
@@ -219,8 +251,20 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         </div>
       </div>
       <div class="toolbar">
-        <button id="relay1Btn" type="button">Relais GPIO 4: OFF</button>
-        <button id="relay2Btn" type="button">Relais GPIO 32: OFF</button>
+        <div class="relay-control">
+          <span class="relay-label">Relais GPIO 4</span>
+          <label class="switch">
+            <input id="relay1Switch" type="checkbox" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div class="relay-control">
+          <span class="relay-label">Relais GPIO 32</span>
+          <label class="switch">
+            <input id="relay2Switch" type="checkbox" />
+            <span class="slider"></span>
+          </label>
+        </div>
       </div>
     </header>
 
@@ -259,36 +303,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const currentEl = document.getElementById('current');
     const powerEl = document.getElementById('power');
     const energyEl = document.getElementById('energy');
-    const relay1Btn = document.getElementById('relay1Btn');
-    const relay2Btn = document.getElementById('relay2Btn');
-
-    const animate = (el) => {
-      el.classList.add('pulse');
-      setTimeout(() => el.classList.remove('pulse'), 180);
-    };
+    const relay1Switch = document.getElementById('relay1Switch');
+    const relay2Switch = document.getElementById('relay2Switch');
 
     function updateUI(data) {
       if (typeof data.voltage === 'number') {
         voltageEl.innerHTML = `${data.voltage.toFixed(2)}<span class="unit">V</span>`;
-        animate(voltageEl);
       }
       if (typeof data.current === 'number') {
         currentEl.innerHTML = `${data.current.toFixed(3)}<span class="unit">A</span>`;
-        animate(currentEl);
       }
       if (typeof data.power === 'number') {
         powerEl.innerHTML = `${data.power.toFixed(1)}<span class="unit">W</span>`;
-        animate(powerEl);
       }
       if (typeof data.energy === 'number') {
         energyEl.innerHTML = `${data.energy.toFixed(3)}<span class="unit">kWh</span>`;
-        animate(energyEl);
       }
       if (typeof data.relay1 === 'boolean') {
-        relay1Btn.textContent = `Relais GPIO 4: ${data.relay1 ? 'ON' : 'OFF'}`;
+        relay1Switch.checked = data.relay1;
       }
       if (typeof data.relay2 === 'boolean') {
-        relay2Btn.textContent = `Relais GPIO 32: ${data.relay2 ? 'ON' : 'OFF'}`;
+        relay2Switch.checked = data.relay2;
       }
     }
 
@@ -325,9 +360,10 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       };
     }
 
-    async function toggleRelay(relayId) {
+    async function setRelay(relayId, enabled) {
       try {
-        const res = await fetch(`/relay/${relayId}/toggle`);
+        const state = enabled ? 1 : 0;
+        const res = await fetch(`/relay/${relayId}/set?state=${state}`);
         const data = await res.json();
         updateUI(data);
       } catch (e) {
@@ -335,8 +371,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }
     }
 
-    relay1Btn.addEventListener('click', () => toggleRelay(1));
-    relay2Btn.addEventListener('click', () => toggleRelay(2));
+    relay1Switch.addEventListener('change', (event) => setRelay(1, event.target.checked));
+    relay2Switch.addEventListener('change', (event) => setRelay(2, event.target.checked));
     connectWS();
   </script>
 </body>
@@ -494,14 +530,18 @@ void setup() {
     request->send(200, "application/json", buildHistoryJson());
   });
 
-  server.on("/relay/1/toggle", HTTP_GET, [](AsyncWebServerRequest* request) {
-    relay1State = !relay1State;
+  server.on("/relay/1/set", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("state")) {
+      relay1State = request->getParam("state")->value().toInt() != 0;
+    }
     digitalWrite(RELAY1_PIN, relay1State ? HIGH : LOW);
     request->send(200, "application/json", buildCurrentJson());
   });
 
-  server.on("/relay/2/toggle", HTTP_GET, [](AsyncWebServerRequest* request) {
-    relay2State = !relay2State;
+  server.on("/relay/2/set", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("state")) {
+      relay2State = request->getParam("state")->value().toInt() != 0;
+    }
     digitalWrite(RELAY2_PIN, relay2State ? HIGH : LOW);
     request->send(200, "application/json", buildCurrentJson());
   });
