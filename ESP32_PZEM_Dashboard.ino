@@ -53,6 +53,10 @@ unsigned long lastSimPollMs = 0;
 constexpr unsigned long SAMPLE_INTERVAL_MS = 1000;
 constexpr unsigned long SIM_POLL_INTERVAL_MS = 5000;
 
+void simSendSms(const String& number, const String& message);
+String getDateTimeString();
+void autoReplyInfoRequest(const String& sender, const String& messageText, const String& status);
+
 struct Sample {
   float voltage;
   float current;
@@ -361,6 +365,8 @@ void updateLatestSimMessage() {
     if (msgEnd < 0) msgEnd = listResp.length();
 
     const String msgText = listResp.substring(msgStart, msgEnd);
+    autoReplyInfoRequest(from, msgText, status);
+
     if (status == "STO UNSENT" || status == "STO SENT") {
       if (msgIndex >= 0) sendSimCommand("AT+CMGD=" + String(msgIndex), 600);
     } else if (status == "REC UNREAD" || status == "REC READ") {
@@ -442,12 +448,37 @@ void simCallNumber(const String& number) {
   sendSimCommand("ATD" + number + ";", 800);
 }
 
+String getDateTimeString() {
+  if (!rtcAvailable) return "00/00/0000 00:00:00";
+  DateTime now = rtc.now();
+  char buffer[20];
+  snprintf(buffer, sizeof(buffer), "%02d/%02d/%04d %02d:%02d:%02d",
+           now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second());
+  return String(buffer);
+}
+
 String getTimeString() {
   if (!rtcAvailable) return "00:00:00";
   DateTime now = rtc.now();
   char buffer[9];
   snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
   return String(buffer);
+}
+
+void autoReplyInfoRequest(const String& sender, const String& messageText, const String& status) {
+  if (status != "REC UNREAD") return;
+  String normalized = messageText;
+  normalized.trim();
+  normalized.toUpperCase();
+  if (normalized != "INFO") return;
+  if (sender.length() == 0) return;
+
+  const String response = "Information ce " + getDateTimeString() +
+                          "\nTension: " + String(lastVoltage, 2) + " V" +
+                          ",Courant:" + String(lastCurrent, 3) + " A" +
+                          ",Power:" + String(lastPower, 1) + " W" +
+                          ",Conso Totale:" + String(lastEnergy, 3) + " kWh";
+  simSendSms(sender, response);
 }
 
 void readSensors() {
