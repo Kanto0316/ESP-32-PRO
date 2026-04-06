@@ -95,6 +95,11 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .footer-note { margin-top:10px; color:var(--muted); font-size:.85rem; }
     .input { width:100%; height:42px; border-radius:10px; background:#0b1220; color:#f8fafc; border:1px solid var(--border); padding:0 10px; }
     .btn { padding:10px 12px; border:none; border-radius:10px; color:#fff; cursor:pointer; }
+    .btn:disabled { opacity:.55; cursor:not-allowed; }
+    .btn-primary { background:#0ea5e9; }
+    .btn-danger { background:#dc2626; }
+    .muted { color:var(--muted); font-size:.88rem; }
+    .textarea { width:100%; min-height:90px; border-radius:10px; background:#0b1220; color:#f8fafc; border:1px solid var(--border); padding:10px; resize:vertical; }
   </style>
 </head>
 <body>
@@ -127,6 +132,25 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
           <div id="simStatus" class="value" style="font-size:1.2rem;">Non connecté au réseau</div>
         </div>
       </div>
+      <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-top:14px;">
+        <div>
+          <div class="label">Message reçu</div>
+          <div id="simSender" class="muted">Expéditeur: -</div>
+          <textarea id="receivedMessage" class="textarea" readonly>Aucun message</textarea>
+          <div style="margin-top:8px;">
+            <button id="deleteMessageBtn" class="btn btn-danger">Supprimer le message</button>
+          </div>
+        </div>
+        <div>
+          <div class="label">Envoyer un SMS</div>
+          <input id="smsNumber" class="input" placeholder="Numéro (ex: +33612345678)" />
+          <textarea id="smsText" class="textarea" style="margin-top:8px;" placeholder="Votre message..."></textarea>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:8px;">
+            <button id="sendSmsBtn" class="btn btn-primary">Envoyer</button>
+            <span id="sendHint" class="muted">Disponible seulement si le réseau est connecté.</span>
+          </div>
+        </div>
+      </div>
     </section>
 
     <div class="footer-note">Mise à jour temps réel via WebSocket (fallback HTTP /data disponible).</div>
@@ -142,6 +166,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const energyEl = document.getElementById('energy');
     const relayAllSwitch = document.getElementById('relayAllSwitch');
     const simStatusEl = document.getElementById('simStatus');
+    const simSenderEl = document.getElementById('simSender');
+    const receivedMessageEl = document.getElementById('receivedMessage');
+    const deleteMessageBtn = document.getElementById('deleteMessageBtn');
+    const smsNumberEl = document.getElementById('smsNumber');
+    const smsTextEl = document.getElementById('smsText');
+    const sendSmsBtn = document.getElementById('sendSmsBtn');
+    const sendHintEl = document.getElementById('sendHint');
+    let simConnected = false;
 
     function updateUI(data) {
       if (typeof data.voltage === 'number') voltageEl.innerHTML = `${data.voltage.toFixed(2)}<span class="unit">V</span>`;
@@ -150,9 +182,14 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       if (typeof data.energy === 'number') energyEl.innerHTML = `${data.energy.toFixed(3)}<span class="unit">kWh</span>`;
       if (typeof data.relay1 === 'boolean' && typeof data.relay2 === 'boolean') relayAllSwitch.checked = data.relay1 && data.relay2;
       if (typeof data.simNetworkStatus === 'string') {
+        simConnected = !!data.simNetworkConnected;
         simStatusEl.textContent = data.simNetworkStatus;
-        simStatusEl.style.color = data.simNetworkConnected ? '#22c55e' : '#ef4444';
+        simStatusEl.style.color = simConnected ? '#22c55e' : '#ef4444';
+        sendSmsBtn.disabled = !simConnected;
+        sendHintEl.textContent = simConnected ? 'Réseau connecté: envoi SMS possible.' : 'Disponible seulement si le réseau est connecté.';
       }
+      if (typeof data.simLastSender === 'string') simSenderEl.textContent = `Expéditeur: ${data.simLastSender || '-'}`;
+      if (typeof data.simLastMessage === 'string') receivedMessageEl.value = data.simLastMessage || 'Aucun message';
     }
 
     function setConnected(ok) { statusDot.classList.toggle('connected', ok); statusText.textContent = ok ? 'Connecté' : 'Déconnecté'; }
@@ -173,6 +210,24 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     }
 
     relayAllSwitch.addEventListener('change', (e) => setAllRelays(e.target.checked));
+
+    deleteMessageBtn.addEventListener('click', async () => {
+      const res = await fetch('/sim/message/delete');
+      updateUI(await res.json());
+    });
+
+    sendSmsBtn.addEventListener('click', async () => {
+      if (!simConnected) return;
+      const number = smsNumberEl.value.trim();
+      const message = smsTextEl.value.trim();
+      if (!number || !message) return;
+      const url = `/sim/sms?number=${encodeURIComponent(number)}&message=${encodeURIComponent(message)}`;
+      const res = await fetch(url);
+      const json = await res.json();
+      if (json.ok) smsTextEl.value = '';
+      if (json.error) sendHintEl.textContent = json.error;
+    });
+
     connectWS();
   </script>
 </body>
@@ -263,6 +318,12 @@ void updateLatestSimMessage() {
     simLastSender = "";
     simLastMessage = "Aucun message";
   }
+}
+
+void clearLatestSimMessage() {
+  sendSimCommand("AT+CMGD=1,4", 1000);
+  simLastSender = "";
+  simLastMessage = "Aucun message";
 }
 
 void updateSimNetworkStatus() {
@@ -414,10 +475,20 @@ void setup() {
   });
 
   server.on("/sim/sms", HTTP_GET, [](AsyncWebServerRequest* request) {
+    updateSimNetworkStatus();
+    if (!simNetworkConnected) {
+      request->send(409, "application/json", "{\"ok\":false,\"error\":\"Reseau non connecte\"}");
+      return;
+    }
     if (request->hasParam("number") && request->hasParam("message")) {
       simSendSms(request->getParam("number")->value(), request->getParam("message")->value());
     }
     request->send(200, "application/json", "{\"ok\":true}");
+  });
+
+  server.on("/sim/message/delete", HTTP_GET, [](AsyncWebServerRequest* request) {
+    clearLatestSimMessage();
+    request->send(200, "application/json", buildCurrentJson());
   });
 
   server.onNotFound([](AsyncWebServerRequest* request) { request->send(404, "application/json", "{\"error\":\"Not found\"}"); });
