@@ -35,6 +35,8 @@ bool rtcAvailable = false;
 struct Sample {
   float voltage;
   float current;
+  float power;
+  float energy;
   char timeStr[9];
 };
 
@@ -45,6 +47,8 @@ size_t historyHead = 0;
 
 float lastVoltage = 0.0f;
 float lastCurrent = 0.0f;
+float lastPower = 0.0f;
+float lastEnergy = 0.0f;
 char lastTime[9] = "00:00:00";
 bool relayState = false; // Préparation future pour relais
 
@@ -230,10 +234,25 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </section>
 
       <section class="card">
+        <div class="label">🔥 Puissance</div>
+        <div id="power" class="value">0.0<span class="unit">W</span></div>
+      </section>
+
+      <section class="card">
+        <div class="label">🧮 Conso totale</div>
+        <div id="energy" class="value">0.000<span class="unit">kWh</span></div>
+      </section>
+
+      <section class="card">
         <div class="label">🕒 Heure RTC</div>
         <div id="time" class="value">00:00:00</div>
       </section>
     </main>
+
+    <section class="card">
+      <div class="label">📈 Tension en fonction du temps</div>
+      <canvas id="voltageChart" height="220"></canvas>
+    </section>
 
     <div class="footer-note">Mise à jour temps réel via WebSocket (fallback HTTP /data disponible).</div>
   </div>
@@ -246,9 +265,18 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const statusText = document.getElementById('statusText');
     const voltageEl = document.getElementById('voltage');
     const currentEl = document.getElementById('current');
+    const powerEl = document.getElementById('power');
+    const energyEl = document.getElementById('energy');
     const timeEl = document.getElementById('time');
     const relayBtn = document.getElementById('relayBtn');
     const relayStateEl = document.getElementById('relayState');
+    const voltageChart = document.getElementById('voltageChart');
+
+    const chartState = {
+      labels: [],
+      values: [],
+      maxPoints: 120
+    };
 
     const animate = (el) => {
       el.classList.add('pulse');
@@ -264,12 +292,24 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         currentEl.innerHTML = `${data.current.toFixed(3)}<span class="unit">A</span>`;
         animate(currentEl);
       }
+      if (typeof data.power === 'number') {
+        powerEl.innerHTML = `${data.power.toFixed(1)}<span class="unit">W</span>`;
+        animate(powerEl);
+      }
+      if (typeof data.energy === 'number') {
+        energyEl.innerHTML = `${data.energy.toFixed(3)}<span class="unit">kWh</span>`;
+        animate(energyEl);
+      }
       if (typeof data.time === 'string') {
         timeEl.textContent = data.time;
         animate(timeEl);
       }
       if (typeof data.relay === 'boolean') {
         relayStateEl.textContent = `Relais: ${data.relay ? 'ON' : 'OFF'}`;
+      }
+
+      if (typeof data.voltage === 'number' && typeof data.time === 'string') {
+        pushChartPoint(data.time, data.voltage);
       }
     }
 
@@ -306,6 +346,111 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       };
     }
 
+    function drawVoltageChart() {
+      const ctx = voltageChart.getContext('2d');
+      const width = voltageChart.clientWidth || voltageChart.parentElement.clientWidth || 600;
+      const height = voltageChart.clientHeight || 220;
+
+      const dpr = window.devicePixelRatio || 1;
+      voltageChart.width = Math.floor(width * dpr);
+      voltageChart.height = Math.floor(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = '#0f172a';
+      ctx.fillRect(0, 0, width, height);
+
+      const padding = { top: 20, right: 16, bottom: 34, left: 50 };
+      const plotW = width - padding.left - padding.right;
+      const plotH = height - padding.top - padding.bottom;
+
+      if (plotW <= 0 || plotH <= 0) {
+        return;
+      }
+
+      ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+      ctx.lineWidth = 1;
+      for (let i = 0; i <= 4; i++) {
+        const y = padding.top + (i * plotH) / 4;
+        ctx.beginPath();
+        ctx.moveTo(padding.left, y);
+        ctx.lineTo(width - padding.right, y);
+        ctx.stroke();
+      }
+
+      if (chartState.values.length < 2) {
+        ctx.fillStyle = 'rgba(156,163,175,0.9)';
+        ctx.font = '13px Inter, sans-serif';
+        ctx.fillText('En attente de données...', padding.left, padding.top + 20);
+        return;
+      }
+
+      let minV = Math.min(...chartState.values);
+      let maxV = Math.max(...chartState.values);
+      if (Math.abs(maxV - minV) < 0.5) {
+        maxV += 0.25;
+        minV -= 0.25;
+      }
+
+      const toX = (index) => padding.left + (index * plotW) / (chartState.values.length - 1);
+      const toY = (value) => padding.top + ((maxV - value) * plotH) / (maxV - minV);
+
+      ctx.strokeStyle = '#22d3ee';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      chartState.values.forEach((value, index) => {
+        const x = toX(index);
+        const y = toY(value);
+        if (index === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+      });
+      ctx.stroke();
+
+      ctx.fillStyle = '#9ca3af';
+      ctx.font = '12px Inter, sans-serif';
+      ctx.fillText(`${maxV.toFixed(1)} V`, 8, padding.top + 4);
+      ctx.fillText(`${minV.toFixed(1)} V`, 8, padding.top + plotH);
+
+      const lastLabel = chartState.labels[chartState.labels.length - 1];
+      const firstLabel = chartState.labels[0];
+      ctx.fillText(firstLabel, padding.left, height - 10);
+      ctx.fillText(lastLabel, width - padding.right - 46, height - 10);
+    }
+
+    function pushChartPoint(label, value) {
+      chartState.labels.push(label);
+      chartState.values.push(value);
+      if (chartState.values.length > chartState.maxPoints) {
+        chartState.labels.shift();
+        chartState.values.shift();
+      }
+      drawVoltageChart();
+    }
+
+    async function loadHistoryForChart() {
+      try {
+        const res = await fetch('/history');
+        const history = await res.json();
+        chartState.labels = [];
+        chartState.values = [];
+
+        history.forEach((sample) => {
+          if (typeof sample.time === 'string' && typeof sample.voltage === 'number') {
+            chartState.labels.push(sample.time);
+            chartState.values.push(sample.voltage);
+          }
+        });
+
+        if (chartState.values.length > chartState.maxPoints) {
+          chartState.labels = chartState.labels.slice(-chartState.maxPoints);
+          chartState.values = chartState.values.slice(-chartState.maxPoints);
+        }
+        drawVoltageChart();
+      } catch (e) {
+        console.warn('Historique indisponible pour le graphe:', e);
+      }
+    }
+
     async function toggleRelay() {
       try {
         const res = await fetch('/relay/toggle');
@@ -329,6 +474,9 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     relayBtn.addEventListener('click', toggleRelay);
     document.getElementById('historyBtn').addEventListener('click', checkHistory);
 
+    window.addEventListener('resize', drawVoltageChart);
+    drawVoltageChart();
+    loadHistoryForChart();
     connectWS();
   </script>
 </body>
@@ -348,6 +496,8 @@ String getTimeString() {
 void readSensors() {
   float v = pzem.voltage();
   float c = pzem.current();
+  float p = pzem.power();
+  float e = pzem.energy();
 
   if (!isnan(v)) {
     lastVoltage = v;
@@ -355,29 +505,39 @@ void readSensors() {
   if (!isnan(c)) {
     lastCurrent = c;
   }
+  if (!isnan(p)) {
+    lastPower = p;
+  }
+  if (!isnan(e)) {
+    lastEnergy = e;
+  }
 
   String t = getTimeString();
   t.toCharArray(lastTime, sizeof(lastTime));
 }
 
 String buildCurrentJson() {
-  char payload[160];
+  char payload[220];
   snprintf(
     payload,
     sizeof(payload),
-    "{\"voltage\":%.2f,\"current\":%.3f,\"time\":\"%s\",\"relay\":%s}",
+    "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.1f,\"energy\":%.3f,\"time\":\"%s\",\"relay\":%s}",
     lastVoltage,
     lastCurrent,
+    lastPower,
+    lastEnergy,
     lastTime,
     relayState ? "true" : "false"
   );
   return String(payload);
 }
 
-void pushHistory(float v, float c, const char* t) {
+void pushHistory(float v, float c, float p, float e, const char* t) {
   Sample s;
   s.voltage = v;
   s.current = c;
+  s.power = p;
+  s.energy = e;
   strlcpy(s.timeStr, t, sizeof(s.timeStr));
 
   historyBuffer[historyHead] = s;
@@ -393,8 +553,17 @@ String buildHistoryJson() {
     size_t idx = (historyHead + HISTORY_SIZE - historyCount + i) % HISTORY_SIZE;
     const Sample& s = historyBuffer[idx];
 
-    char row[120];
-    snprintf(row, sizeof(row), "{\"voltage\":%.2f,\"current\":%.3f,\"time\":\"%s\"}", s.voltage, s.current, s.timeStr);
+    char row[170];
+    snprintf(
+      row,
+      sizeof(row),
+      "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.1f,\"energy\":%.3f,\"time\":\"%s\"}",
+      s.voltage,
+      s.current,
+      s.power,
+      s.energy,
+      s.timeStr
+    );
     json += row;
     if (i + 1 < historyCount) {
       json += ",";
@@ -480,10 +649,17 @@ void loop() {
     lastSampleMs = nowMs;
 
     readSensors();
-    pushHistory(lastVoltage, lastCurrent, lastTime);
+    pushHistory(lastVoltage, lastCurrent, lastPower, lastEnergy, lastTime);
     notifyClients();
 
-    Serial.printf("[DATA] U=%.2f V | I=%.3f A | T=%s\n", lastVoltage, lastCurrent, lastTime);
+    Serial.printf(
+      "[DATA] U=%.2f V | I=%.3f A | P=%.1f W | E=%.3f kWh | T=%s\n",
+      lastVoltage,
+      lastCurrent,
+      lastPower,
+      lastEnergy,
+      lastTime
+    );
   }
 
   ws.cleanupClients();
