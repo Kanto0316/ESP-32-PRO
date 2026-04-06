@@ -42,6 +42,11 @@ String simLastMessage = "Aucun message";
 String simLastSender = "";
 bool simNetworkConnected = false;
 String simNetworkStatus = "Non connecte au reseau";
+constexpr size_t SIM_MESSAGE_HISTORY_SIZE = 8;
+int simMessageIndexes[SIM_MESSAGE_HISTORY_SIZE];
+String simMessageSenders[SIM_MESSAGE_HISTORY_SIZE];
+String simMessageTexts[SIM_MESSAGE_HISTORY_SIZE];
+size_t simMessageCount = 0;
 
 unsigned long lastSampleMs = 0;
 unsigned long lastSimPollMs = 0;
@@ -100,6 +105,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .btn-danger { background:#dc2626; }
     .muted { color:var(--muted); font-size:.88rem; }
     .textarea { width:100%; min-height:90px; border-radius:10px; background:#0b1220; color:#f8fafc; border:1px solid var(--border); padding:10px; resize:vertical; }
+    .message-list { display:flex; flex-direction:column; gap:8px; margin-top:8px; max-height:280px; overflow:auto; }
+    .message-item { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; border:1px solid var(--border); border-radius:10px; padding:8px 10px; background:#0b1220; }
+    .message-meta { color:var(--muted); font-size:.82rem; margin-bottom:4px; }
+    .message-text { white-space:pre-wrap; word-break:break-word; font-size:.92rem; }
+    .icon-btn { width:22px; height:22px; border:none; border-radius:999px; background:#dc2626; color:#fff; font-weight:700; cursor:pointer; line-height:1; }
+    .select { width:100%; height:42px; border-radius:10px; background:#0b1220; color:#f8fafc; border:1px solid var(--border); padding:0 10px; }
   </style>
 </head>
 <body>
@@ -134,19 +145,23 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </div>
       <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-top:14px;">
         <div>
-          <div class="label">Message reçu</div>
-          <div id="simSender" class="muted">Expéditeur: -</div>
-          <textarea id="receivedMessage" class="textarea" readonly>Aucun message</textarea>
+          <div class="label">Messages reçus</div>
+          <div id="simListHint" class="muted">Aucun message</div>
+          <div id="messageList" class="message-list"></div>
           <div style="margin-top:8px;">
-            <button id="deleteMessageBtn" class="btn btn-danger">Supprimer le message</button>
+            <button id="deleteMessageBtn" class="btn btn-danger">Supprimer tous les messages</button>
           </div>
         </div>
         <div>
-          <div class="label">Envoyer un SMS</div>
+          <div class="label">Action SIM</div>
+          <select id="simAction" class="select">
+            <option value="sms">Envoyer un message</option>
+            <option value="call">Appeler un numéro</option>
+          </select>
           <input id="smsNumber" class="input" placeholder="Numéro (ex: +33612345678)" />
           <textarea id="smsText" class="textarea" style="margin-top:8px;" placeholder="Votre message..."></textarea>
           <div style="display:flex;align-items:center;gap:8px;margin-top:8px;">
-            <button id="sendSmsBtn" class="btn btn-primary">Envoyer</button>
+            <button id="sendSmsBtn" class="btn btn-primary">Exécuter</button>
             <span id="sendHint" class="muted">Disponible seulement si le réseau est connecté.</span>
           </div>
         </div>
@@ -166,14 +181,43 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const energyEl = document.getElementById('energy');
     const relayAllSwitch = document.getElementById('relayAllSwitch');
     const simStatusEl = document.getElementById('simStatus');
-    const simSenderEl = document.getElementById('simSender');
-    const receivedMessageEl = document.getElementById('receivedMessage');
+    const simListHintEl = document.getElementById('simListHint');
+    const messageListEl = document.getElementById('messageList');
     const deleteMessageBtn = document.getElementById('deleteMessageBtn');
+    const simActionEl = document.getElementById('simAction');
     const smsNumberEl = document.getElementById('smsNumber');
     const smsTextEl = document.getElementById('smsText');
     const sendSmsBtn = document.getElementById('sendSmsBtn');
     const sendHintEl = document.getElementById('sendHint');
     let simConnected = false;
+
+    function renderMessageList(messages) {
+      messageListEl.innerHTML = '';
+      if (!Array.isArray(messages) || messages.length === 0) {
+        simListHintEl.textContent = 'Aucun message';
+        return;
+      }
+      simListHintEl.textContent = `${messages.length} message(s) reçu(s)`;
+      messages.forEach((msg) => {
+        const item = document.createElement('div');
+        item.className = 'message-item';
+        const content = document.createElement('div');
+        const sender = msg.sender || '-';
+        content.innerHTML = `<div class="message-meta">Expéditeur: ${sender}</div><div class="message-text">${msg.text || ''}</div>`;
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'icon-btn';
+        deleteBtn.textContent = '×';
+        deleteBtn.title = 'Supprimer ce message';
+        deleteBtn.addEventListener('click', async () => {
+          if (typeof msg.index !== 'number') return;
+          const res = await fetch(`/sim/message/delete?index=${msg.index}`);
+          updateUI(await res.json());
+        });
+        item.appendChild(content);
+        item.appendChild(deleteBtn);
+        messageListEl.appendChild(item);
+      });
+    }
 
     function updateUI(data) {
       if (typeof data.voltage === 'number') voltageEl.innerHTML = `${data.voltage.toFixed(2)}<span class="unit">V</span>`;
@@ -188,8 +232,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
         sendSmsBtn.disabled = !simConnected;
         sendHintEl.textContent = simConnected ? 'Réseau connecté: envoi SMS possible.' : 'Disponible seulement si le réseau est connecté.';
       }
-      if (typeof data.simLastSender === 'string') simSenderEl.textContent = `Expéditeur: ${data.simLastSender || '-'}`;
-      if (typeof data.simLastMessage === 'string') receivedMessageEl.value = data.simLastMessage || 'Aucun message';
+      if (Array.isArray(data.simMessages)) renderMessageList(data.simMessages);
     }
 
     function setConnected(ok) { statusDot.classList.toggle('connected', ok); statusText.textContent = ok ? 'Connecté' : 'Déconnecté'; }
@@ -218,14 +261,27 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
 
     sendSmsBtn.addEventListener('click', async () => {
       if (!simConnected) return;
+      const action = simActionEl.value;
       const number = smsNumberEl.value.trim();
-      const message = smsTextEl.value.trim();
-      if (!number || !message) return;
-      const url = `/sim/sms?number=${encodeURIComponent(number)}&message=${encodeURIComponent(message)}`;
+      if (!number) return;
+      let url = '';
+      if (action === 'call') {
+        url = `/sim/call?number=${encodeURIComponent(number)}`;
+      } else {
+        const message = smsTextEl.value.trim();
+        if (!message) return;
+        url = `/sim/sms?number=${encodeURIComponent(number)}&message=${encodeURIComponent(message)}`;
+      }
       const res = await fetch(url);
       const json = await res.json();
-      if (json.ok) smsTextEl.value = '';
+      if (json.ok && action !== 'call') smsTextEl.value = '';
       if (json.error) sendHintEl.textContent = json.error;
+    });
+
+    simActionEl.addEventListener('change', () => {
+      const callMode = simActionEl.value === 'call';
+      smsTextEl.style.display = callMode ? 'none' : 'block';
+      sendSmsBtn.textContent = callMode ? 'Appeler' : 'Envoyer';
     });
 
     connectWS();
@@ -272,6 +328,7 @@ void setAllRelays(bool enabled) {
 void updateLatestSimMessage() {
   const String listResp = sendSimCommand("AT+CMGL=\"ALL\"", 1500);
   int pos = 0;
+  simMessageCount = 0;
   int newestIdx = -1;
   String newestFrom;
   String newestText;
@@ -287,9 +344,11 @@ void updateLatestSimMessage() {
     const int idxSep = meta.indexOf(':');
     const int comma = meta.indexOf(',', idxSep + 1);
     const int msgIndex = (idxSep >= 0 && comma > idxSep) ? meta.substring(idxSep + 1, comma).toInt() : -1;
+    const int statusQ1 = meta.indexOf('"', comma + 1);
+    const int statusQ2 = (statusQ1 >= 0) ? meta.indexOf('"', statusQ1 + 1) : -1;
+    const String status = (statusQ1 >= 0 && statusQ2 > statusQ1) ? meta.substring(statusQ1 + 1, statusQ2) : "";
 
-    const int q1 = meta.indexOf('"');
-    const int q2 = (q1 >= 0) ? meta.indexOf('"', q1 + 1) : -1;
+    const int q2 = statusQ2;
     const int q3 = (q2 >= 0) ? meta.indexOf('"', q2 + 1) : -1;
     const int q4 = (q3 >= 0) ? meta.indexOf('"', q3 + 1) : -1;
     const String from = (q3 >= 0 && q4 > q3) ? meta.substring(q3 + 1, q4) : "";
@@ -302,10 +361,20 @@ void updateLatestSimMessage() {
     if (msgEnd < 0) msgEnd = listResp.length();
 
     const String msgText = listResp.substring(msgStart, msgEnd);
-    if (msgIndex > newestIdx) {
-      newestIdx = msgIndex;
-      newestFrom = from;
-      newestText = msgText;
+    if (status == "STO UNSENT" || status == "STO SENT") {
+      if (msgIndex >= 0) sendSimCommand("AT+CMGD=" + String(msgIndex), 600);
+    } else if (status == "REC UNREAD" || status == "REC READ") {
+      if (msgIndex > newestIdx) {
+        newestIdx = msgIndex;
+        newestFrom = from;
+        newestText = msgText;
+      }
+      if (simMessageCount < SIM_MESSAGE_HISTORY_SIZE) {
+        simMessageIndexes[simMessageCount] = msgIndex;
+        simMessageSenders[simMessageCount] = sanitizeJson(from);
+        simMessageTexts[simMessageCount] = sanitizeJson(msgText);
+        simMessageCount++;
+      }
     }
     pos = msgEnd;
   }
@@ -324,6 +393,23 @@ void clearLatestSimMessage() {
   sendSimCommand("AT+CMGD=1,4", 1000);
   simLastSender = "";
   simLastMessage = "Aucun message";
+  simMessageCount = 0;
+}
+
+String buildSimMessagesJson() {
+  String json = "[";
+  for (int i = static_cast<int>(simMessageCount) - 1; i >= 0; i--) {
+    json += "{\"index\":";
+    json += String(simMessageIndexes[i]);
+    json += ",\"sender\":\"";
+    json += simMessageSenders[i];
+    json += "\",\"text\":\"";
+    json += simMessageTexts[i];
+    json += "\"}";
+    if (i > 0) json += ",";
+  }
+  json += "]";
+  return json;
 }
 
 void updateSimNetworkStatus() {
@@ -382,14 +468,25 @@ void readSensors() {
 String buildCurrentJson() {
   const String safeMsg = sanitizeJson(simLastMessage);
   const String safeFrom = sanitizeJson(simLastSender);
-  char payload[520];
-  snprintf(payload, sizeof(payload),
-           "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.1f,\"energy\":%.3f,\"time\":\"%s\",\"relay1\":%s,\"relay2\":%s,\"simLastMessage\":\"%s\",\"simLastSender\":\"%s\",\"simNetworkConnected\":%s,\"simNetworkStatus\":\"%s\"}",
-           lastVoltage, lastCurrent, lastPower, lastEnergy, lastTime,
-           relay1State ? "true" : "false", relay2State ? "true" : "false",
-           safeMsg.c_str(), safeFrom.c_str(),
-           simNetworkConnected ? "true" : "false", sanitizeJson(simNetworkStatus).c_str());
-  return String(payload);
+  String payload = "{";
+  payload += "\"voltage\":" + String(lastVoltage, 2);
+  payload += ",\"current\":" + String(lastCurrent, 3);
+  payload += ",\"power\":" + String(lastPower, 1);
+  payload += ",\"energy\":" + String(lastEnergy, 3);
+  payload += ",\"time\":\"" + String(lastTime) + "\"";
+  payload += ",\"relay1\":";
+  payload += (relay1State ? "true" : "false");
+  payload += ",\"relay2\":";
+  payload += (relay2State ? "true" : "false");
+  payload += ",\"simLastMessage\":\"" + safeMsg + "\"";
+  payload += ",\"simLastSender\":\"" + safeFrom + "\"";
+  payload += ",\"simNetworkConnected\":";
+  payload += (simNetworkConnected ? "true" : "false");
+  payload += ",\"simNetworkStatus\":\"" + sanitizeJson(simNetworkStatus) + "\"";
+  payload += ",\"simMessages\":";
+  payload += buildSimMessagesJson();
+  payload += "}";
+  return payload;
 }
 
 void pushHistory(float v, float c, float p, float e, const char* t) {
@@ -487,7 +584,13 @@ void setup() {
   });
 
   server.on("/sim/message/delete", HTTP_GET, [](AsyncWebServerRequest* request) {
-    clearLatestSimMessage();
+    if (request->hasParam("index")) {
+      const int idx = request->getParam("index")->value().toInt();
+      if (idx > 0) sendSimCommand("AT+CMGD=" + String(idx), 800);
+      updateLatestSimMessage();
+    } else {
+      clearLatestSimMessage();
+    }
     request->send(200, "application/json", buildCurrentJson());
   });
 
