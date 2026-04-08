@@ -4,8 +4,12 @@
 #include <PZEM004Tv30.h>
 #include <Wire.h>
 #include <RTClib.h>
-#include <HardwareSerial.h>
+#include <SPI.h>
+#include <SD.h>
 
+// ---------------------------
+// Configuration
+// ---------------------------
 constexpr const char* AP_SSID = "ESP-MONITORING";
 constexpr const char* AP_PASSWORD = "12345678";
 
@@ -17,18 +21,30 @@ constexpr uint8_t PZEM_RX_PIN = 26;
 constexpr uint8_t PZEM_TX_PIN = 27;
 constexpr uint8_t I2C_SDA_PIN = 21;
 constexpr uint8_t I2C_SCL_PIN = 22;
-constexpr uint8_t SIM800_RX_PIN = 17;
-constexpr uint8_t SIM800_TX_PIN = 16;
 constexpr uint8_t RELAY1_PIN = 4;
 constexpr uint8_t RELAY2_PIN = 32;
 
+// SD (SPI) pins
+constexpr uint8_t SD_MISO_PIN = 19;
+constexpr uint8_t SD_MOSI_PIN = 23;
+constexpr uint8_t SD_SCK_PIN = 18;
+constexpr uint8_t SD_CS_PIN = 5;
+constexpr const char* LOG_FILE_PATH = "/log.csv";
+
+constexpr unsigned long SENSOR_INTERVAL_MS = 1000;
+constexpr unsigned long LOG_INTERVAL_MS = 5000;
+constexpr size_t HISTORY_SIZE = 120;
+
+// ---------------------------
+// Globals
+// ---------------------------
 AsyncWebServer server(80);
-AsyncWebSocket ws("/ws");
 RTC_DS3231 rtc;
 PZEM004Tv30 pzem(Serial2, PZEM_RX_PIN, PZEM_TX_PIN);
-HardwareSerial sim800(1);
+SPIClass sdSpi(VSPI);
 
 bool rtcAvailable = false;
+bool sdReady = false;
 bool relay1State = false;
 bool relay2State = false;
 
@@ -36,40 +52,273 @@ float lastVoltage = 0.0f;
 float lastCurrent = 0.0f;
 float lastPower = 0.0f;
 float lastEnergy = 0.0f;
-char lastTime[9] = "00:00:00";
 
-String simLastMessage = "Aucun message";
-String simLastSender = "";
-bool simNetworkConnected = false;
-String simNetworkStatus = "Non connecte au reseau";
-constexpr size_t SIM_MESSAGE_HISTORY_SIZE = 8;
-int simMessageIndexes[SIM_MESSAGE_HISTORY_SIZE];
-String simMessageSenders[SIM_MESSAGE_HISTORY_SIZE];
-String simMessageTexts[SIM_MESSAGE_HISTORY_SIZE];
-size_t simMessageCount = 0;
-
-unsigned long lastSampleMs = 0;
-unsigned long lastSimPollMs = 0;
-constexpr unsigned long SAMPLE_INTERVAL_MS = 1000;
-constexpr unsigned long SIM_POLL_INTERVAL_MS = 5000;
-
-void simSendSms(const String& number, const String& message);
-String getDateTimeString();
-void autoReplyInfoRequest(const String& sender, const String& messageText, const String& status);
+unsigned long lastSensorMs = 0;
+unsigned long lastLogMs = 0;
 
 struct Sample {
+  char dateTime[24];
   float voltage;
   float current;
   float power;
   float energy;
-  char timeStr[9];
 };
 
-constexpr size_t HISTORY_SIZE = 120;
 Sample historyBuffer[HISTORY_SIZE];
 size_t historyCount = 0;
 size_t historyHead = 0;
 
+// ---------------------------
+// Utility / Formatting
+// ---------------------------
+String sanitizeJson(const String& input) {
+  String out;
+  out.reserve(input.length() + 8);
+  for (size_t i = 0; i < input.length(); i++) {
+    const char ch = input[i];
+    if (ch == '"' || ch == '\\') {
+      out += '\\';
+      out += ch;
+    } else if (ch == '\n' || ch == '\r') {
+      out += ' ';
+    } else {
+      out += ch;
+    }
+  }
+  return out;
+}
+
+String getDateTimeString() {
+  if (rtcAvailable) {
+    DateTime now = rtc.now();
+    char buffer[24];
+    snprintf(buffer,
+             sizeof(buffer),
+             "%04d-%02d-%02d %02d:%02d:%02d",
+             now.year(),
+             now.month(),
+             now.day(),
+             now.hour(),
+             now.minute(),
+             now.second());
+    return String(buffer);
+  }
+
+  // fallback if RTC unavailable
+  const unsigned long ms = millis();
+  const unsigned long totalSec = ms / 1000;
+  const unsigned long h = (totalSec / 3600) % 24;
+  const unsigned long m = (totalSec / 60) % 60;
+  const unsigned long s = totalSec % 60;
+  char buffer[24];
+  snprintf(buffer, sizeof(buffer), "millis:%lu (%02lu:%02lu:%02lu)", ms, h, m, s);
+  return String(buffer);
+}
+
+void setAllRelays(bool enabled) {
+  relay1State = enabled;
+  relay2State = enabled;
+  digitalWrite(RELAY1_PIN, relay1State ? HIGH : LOW);
+  digitalWrite(RELAY2_PIN, relay2State ? HIGH : LOW);
+}
+
+// ---------------------------
+// PZEM module
+// ---------------------------
+void readPzemData() {
+  const float v = pzem.voltage();
+  const float c = pzem.current();
+  const float p = pzem.power();
+  const float e = pzem.energy();
+
+  if (!isnan(v)) lastVoltage = v;
+  if (!isnan(c)) lastCurrent = c;
+  if (!isnan(p)) lastPower = p;
+  if (!isnan(e)) lastEnergy = e;
+}
+
+void pushHistorySample(const String& dateTime, float v, float c, float p, float e) {
+  Sample sample{};
+  dateTime.toCharArray(sample.dateTime, sizeof(sample.dateTime));
+  sample.voltage = v;
+  sample.current = c;
+  sample.power = p;
+  sample.energy = e;
+
+  historyBuffer[historyHead] = sample;
+  historyHead = (historyHead + 1) % HISTORY_SIZE;
+  if (historyCount < HISTORY_SIZE) {
+    historyCount++;
+  }
+}
+
+String buildCurrentJson() {
+  String payload = "{";
+  payload += "\"datetime\":\"" + sanitizeJson(getDateTimeString()) + "\"";
+  payload += ",\"voltage\":" + String(lastVoltage, 2);
+  payload += ",\"current\":" + String(lastCurrent, 3);
+  payload += ",\"power\":" + String(lastPower, 1);
+  payload += ",\"energy\":" + String(lastEnergy, 3);
+  payload += ",\"relay1\":" + String(relay1State ? "true" : "false");
+  payload += ",\"relay2\":" + String(relay2State ? "true" : "false");
+  payload += ",\"sdReady\":" + String(sdReady ? "true" : "false");
+  payload += "}";
+  return payload;
+}
+
+String buildHistoryJson() {
+  String json = "[";
+  for (size_t i = 0; i < historyCount; i++) {
+    const size_t idx = (historyHead + HISTORY_SIZE - historyCount + i) % HISTORY_SIZE;
+    const Sample& s = historyBuffer[idx];
+    json += "{\"datetime\":\"" + sanitizeJson(String(s.dateTime)) + "\"";
+    json += ",\"voltage\":" + String(s.voltage, 2);
+    json += ",\"current\":" + String(s.current, 3);
+    json += ",\"power\":" + String(s.power, 1);
+    json += ",\"energy\":" + String(s.energy, 3);
+    json += "}";
+    if (i + 1 < historyCount) {
+      json += ",";
+    }
+  }
+  json += "]";
+  return json;
+}
+
+// ---------------------------
+// SD module
+// ---------------------------
+bool ensureLogFile() {
+  if (!sdReady) {
+    return false;
+  }
+
+  if (!SD.exists(LOG_FILE_PATH)) {
+    File file = SD.open(LOG_FILE_PATH, FILE_WRITE);
+    if (!file) {
+      Serial.println("[SD] Erreur: impossible de creer log.csv");
+      return false;
+    }
+    file.println("date,voltage,current,power,energy");
+    file.close();
+    Serial.println("[SD] log.csv cree avec en-tete");
+  }
+  return true;
+}
+
+void initSdCard() {
+  sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
+  sdReady = SD.begin(SD_CS_PIN, sdSpi);
+  if (!sdReady) {
+    Serial.println("[SD] Carte SD absente ou initialisation echouee");
+    return;
+  }
+  Serial.println("[SD] Carte SD initialisee");
+  ensureLogFile();
+}
+
+bool appendLogLine(const String& dateTime, float v, float c, float p, float e) {
+  if (!sdReady) {
+    return false;
+  }
+  if (!ensureLogFile()) {
+    return false;
+  }
+
+  File file = SD.open(LOG_FILE_PATH, FILE_APPEND);
+  if (!file) {
+    Serial.println("[SD] Erreur: fichier log.csv non accessible en ecriture");
+    return false;
+  }
+
+  char line[128];
+  snprintf(line, sizeof(line), "%s,%.2f,%.3f,%.1f,%.3f", dateTime.c_str(), v, c, p, e);
+  file.println(line);
+  file.close();
+  return true;
+}
+
+String readLogsAsText(size_t maxBytes = 8192) {
+  if (!sdReady) {
+    return "error:sd_not_ready";
+  }
+
+  File file = SD.open(LOG_FILE_PATH, FILE_READ);
+  if (!file) {
+    return "error:file_not_accessible";
+  }
+
+  String out;
+  out.reserve(maxBytes + 16);
+  while (file.available() && out.length() < maxBytes) {
+    out += static_cast<char>(file.read());
+  }
+  file.close();
+  return out;
+}
+
+String readLogsAsJson(size_t maxRows = 200) {
+  if (!sdReady) {
+    return "{\"ok\":false,\"error\":\"sd_not_ready\",\"rows\":[]}";
+  }
+
+  File file = SD.open(LOG_FILE_PATH, FILE_READ);
+  if (!file) {
+    return "{\"ok\":false,\"error\":\"file_not_accessible\",\"rows\":[]}";
+  }
+
+  String json = "{\"ok\":true,\"rows\":[";
+  String line;
+  bool headerSkipped = false;
+  size_t rowCount = 0;
+
+  while (file.available() && rowCount < maxRows) {
+    line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) {
+      continue;
+    }
+
+    if (!headerSkipped) {
+      headerSkipped = true;
+      continue;
+    }
+
+    int p1 = line.indexOf(',');
+    int p2 = line.indexOf(',', p1 + 1);
+    int p3 = line.indexOf(',', p2 + 1);
+    int p4 = line.indexOf(',', p3 + 1);
+
+    if (p1 < 0 || p2 < 0 || p3 < 0 || p4 < 0) {
+      continue;
+    }
+
+    String date = line.substring(0, p1);
+    String voltage = line.substring(p1 + 1, p2);
+    String current = line.substring(p2 + 1, p3);
+    String power = line.substring(p3 + 1, p4);
+    String energy = line.substring(p4 + 1);
+
+    if (rowCount > 0) {
+      json += ",";
+    }
+    json += "{\"date\":\"" + sanitizeJson(date) + "\"";
+    json += ",\"voltage\":" + voltage;
+    json += ",\"current\":" + current;
+    json += ",\"power\":" + power;
+    json += ",\"energy\":" + energy;
+    json += "}";
+    rowCount++;
+  }
+
+  file.close();
+  json += "]}";
+  return json;
+}
+
+// ---------------------------
+// Web module
+// ---------------------------
 const char INDEX_HTML[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html lang="fr">
@@ -81,7 +330,7 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     :root { --bg:#0f172a; --card:#111827; --muted:#9ca3af; --text:#f8fafc; --ok:#22c55e; --off:#ef4444; --border:rgba(255,255,255,0.08); }
     * { box-sizing:border-box; }
     body { margin:0; min-height:100vh; font-family:Inter,Segoe UI,Roboto,Arial,sans-serif; color:var(--text); background:var(--bg); padding:18px; }
-    .container { width:min(1024px,100%); margin:0 auto; }
+    .container { width:min(1100px,100%); margin:0 auto; }
     .header { display:flex; justify-content:space-between; align-items:center; gap:12px; margin-bottom:18px; flex-wrap:wrap; }
     .title { margin:0; font-size:clamp(1.3rem,2vw,1.8rem); }
     .status { color:var(--muted); font-size:0.92rem; display:flex; align-items:center; gap:8px; }
@@ -102,19 +351,12 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     .switch input:checked + .slider { background-color:#14b8a6; }
     .switch input:checked + .slider:before { transform:translateX(24px); }
     .footer-note { margin-top:10px; color:var(--muted); font-size:.85rem; }
-    .input { width:100%; height:42px; border-radius:10px; background:#0b1220; color:#f8fafc; border:1px solid var(--border); padding:0 10px; }
-    .btn { padding:10px 12px; border:none; border-radius:10px; color:#fff; cursor:pointer; }
-    .btn:disabled { opacity:.55; cursor:not-allowed; }
-    .btn-primary { background:#0ea5e9; }
-    .btn-danger { background:#dc2626; }
+    .btn { padding:10px 12px; border:none; border-radius:10px; color:#fff; cursor:pointer; background:#0ea5e9; }
     .muted { color:var(--muted); font-size:.88rem; }
-    .textarea { width:100%; min-height:90px; border-radius:10px; background:#0b1220; color:#f8fafc; border:1px solid var(--border); padding:10px; resize:vertical; }
-    .message-list { display:flex; flex-direction:column; gap:8px; margin-top:8px; max-height:280px; overflow:auto; }
-    .message-item { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; border:1px solid var(--border); border-radius:10px; padding:8px 10px; background:#0b1220; }
-    .message-meta { color:var(--muted); font-size:.82rem; margin-bottom:4px; }
-    .message-text { white-space:pre-wrap; word-break:break-word; font-size:.92rem; }
-    .icon-btn { width:22px; height:22px; border:none; border-radius:999px; background:#dc2626; color:#fff; font-weight:700; cursor:pointer; line-height:1; }
-    .select { width:100%; height:42px; border-radius:10px; background:#0b1220; color:#f8fafc; border:1px solid var(--border); padding:0 10px; }
+    .table-wrap { overflow:auto; max-height:340px; border:1px solid var(--border); border-radius:12px; }
+    table { width:100%; border-collapse:collapse; font-size:.9rem; }
+    th, td { padding:8px 10px; border-bottom:1px solid var(--border); text-align:left; white-space:nowrap; }
+    th { position:sticky; top:0; background:#0b1220; z-index:1; }
   </style>
 </head>
 <body>
@@ -140,43 +382,35 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     </main>
 
     <section class="card" style="margin-top:14px;">
-      <div class="label">📶 SIM800</div>
-      <div style="display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
         <div>
-          <div class="label">État réseau</div>
-          <div id="simStatus" class="value" style="font-size:1.2rem;">Non connecté au réseau</div>
+          <div class="label">📚 Historique (SD /log.csv)</div>
+          <div id="sdStatus" class="muted">Statut SD: inconnu</div>
         </div>
+        <a class="btn" href="/download" download>Télécharger CSV</a>
       </div>
-      <div style="display:grid;gap:12px;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));margin-top:14px;">
-        <div>
-          <div class="label">Messages reçus</div>
-          <div id="simListHint" class="muted">Aucun message</div>
-          <div id="messageList" class="message-list"></div>
-          <div style="margin-top:8px;">
-            <button id="deleteMessageBtn" class="btn btn-danger">Supprimer tous les messages</button>
-          </div>
-        </div>
-        <div>
-          <div class="label">Action SIM</div>
-          <select id="simAction" class="select">
-            <option value="sms">Envoyer un message</option>
-            <option value="call">Appeler un numéro</option>
-          </select>
-          <input id="smsNumber" class="input" placeholder="Numéro (ex: +33612345678)" />
-          <textarea id="smsText" class="textarea" style="margin-top:8px;" placeholder="Votre message..."></textarea>
-          <div style="display:flex;align-items:center;gap:8px;margin-top:8px;">
-            <button id="sendSmsBtn" class="btn btn-primary">Exécuter</button>
-            <span id="sendHint" class="muted">Disponible seulement si le réseau est connecté.</span>
-          </div>
-        </div>
+      <div class="table-wrap" style="margin-top:12px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Date</th>
+              <th>Tension (V)</th>
+              <th>Courant (A)</th>
+              <th>Puissance (W)</th>
+              <th>Énergie (kWh)</th>
+            </tr>
+          </thead>
+          <tbody id="historyTableBody">
+            <tr><td colspan="5" class="muted">Aucune donnée</td></tr>
+          </tbody>
+        </table>
       </div>
     </section>
 
-    <div class="footer-note">Mise à jour temps réel via WebSocket (fallback HTTP /data disponible).</div>
+    <div class="footer-note">Mise à jour automatique des mesures et de l'historique toutes les 5 secondes.</div>
   </div>
 
   <script>
-    let ws; let reconnectTimer;
     const statusDot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
     const voltageEl = document.getElementById('voltage');
@@ -184,375 +418,130 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const powerEl = document.getElementById('power');
     const energyEl = document.getElementById('energy');
     const relayAllSwitch = document.getElementById('relayAllSwitch');
-    const simStatusEl = document.getElementById('simStatus');
-    const simListHintEl = document.getElementById('simListHint');
-    const messageListEl = document.getElementById('messageList');
-    const deleteMessageBtn = document.getElementById('deleteMessageBtn');
-    const simActionEl = document.getElementById('simAction');
-    const smsNumberEl = document.getElementById('smsNumber');
-    const smsTextEl = document.getElementById('smsText');
-    const sendSmsBtn = document.getElementById('sendSmsBtn');
-    const sendHintEl = document.getElementById('sendHint');
-    let simConnected = false;
+    const historyTableBody = document.getElementById('historyTableBody');
+    const sdStatus = document.getElementById('sdStatus');
 
-    function renderMessageList(messages) {
-      messageListEl.innerHTML = '';
-      if (!Array.isArray(messages) || messages.length === 0) {
-        simListHintEl.textContent = 'Aucun message';
-        return;
-      }
-      simListHintEl.textContent = `${messages.length} message(s) reçu(s)`;
-      messages.forEach((msg) => {
-        const item = document.createElement('div');
-        item.className = 'message-item';
-        const content = document.createElement('div');
-        const sender = msg.sender || '-';
-        content.innerHTML = `<div class="message-meta">Expéditeur: ${sender}</div><div class="message-text">${msg.text || ''}</div>`;
-        const deleteBtn = document.createElement('button');
-        deleteBtn.className = 'icon-btn';
-        deleteBtn.textContent = '×';
-        deleteBtn.title = 'Supprimer ce message';
-        deleteBtn.addEventListener('click', async () => {
-          if (typeof msg.index !== 'number') return;
-          const res = await fetch(`/sim/message/delete?index=${msg.index}`);
-          updateUI(await res.json());
-        });
-        item.appendChild(content);
-        item.appendChild(deleteBtn);
-        messageListEl.appendChild(item);
-      });
+    function setConnected(ok) {
+      statusDot.classList.toggle('connected', ok);
+      statusText.textContent = ok ? 'Connecté' : 'Déconnecté';
     }
 
-    function updateUI(data) {
+    function updateMetrics(data) {
       if (typeof data.voltage === 'number') voltageEl.innerHTML = `${data.voltage.toFixed(2)}<span class="unit">V</span>`;
       if (typeof data.current === 'number') currentEl.innerHTML = `${data.current.toFixed(3)}<span class="unit">A</span>`;
       if (typeof data.power === 'number') powerEl.innerHTML = `${data.power.toFixed(1)}<span class="unit">W</span>`;
       if (typeof data.energy === 'number') energyEl.innerHTML = `${data.energy.toFixed(3)}<span class="unit">kWh</span>`;
       if (typeof data.relay1 === 'boolean' && typeof data.relay2 === 'boolean') relayAllSwitch.checked = data.relay1 && data.relay2;
-      if (typeof data.simNetworkStatus === 'string') {
-        simConnected = !!data.simNetworkConnected;
-        simStatusEl.textContent = data.simNetworkStatus;
-        simStatusEl.style.color = simConnected ? '#22c55e' : '#ef4444';
-        sendSmsBtn.disabled = !simConnected;
-        sendHintEl.textContent = simConnected ? 'Réseau connecté: envoi SMS possible.' : 'Disponible seulement si le réseau est connecté.';
-      }
-      if (Array.isArray(data.simMessages)) renderMessageList(data.simMessages);
+      if (typeof data.sdReady === 'boolean') sdStatus.textContent = data.sdReady ? 'Statut SD: prête' : 'Statut SD: absente / erreur';
     }
 
-    function setConnected(ok) { statusDot.classList.toggle('connected', ok); statusText.textContent = ok ? 'Connecté' : 'Déconnecté'; }
+    function updateHistoryTable(rows) {
+      if (!Array.isArray(rows) || rows.length === 0) {
+        historyTableBody.innerHTML = '<tr><td colspan="5" class="muted">Aucune donnée</td></tr>';
+        return;
+      }
+      const recentRows = rows.slice(-120).reverse();
+      historyTableBody.innerHTML = recentRows.map(r => {
+        const d = r.date || r.datetime || '-';
+        return `<tr>
+          <td>${d}</td>
+          <td>${Number(r.voltage || 0).toFixed(2)}</td>
+          <td>${Number(r.current || 0).toFixed(3)}</td>
+          <td>${Number(r.power || 0).toFixed(1)}</td>
+          <td>${Number(r.energy || 0).toFixed(3)}</td>
+        </tr>`;
+      }).join('');
+    }
 
-    function connectWS() {
-      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      ws = new WebSocket(`${proto}://${location.host}/ws`);
-      ws.onopen = () => setConnected(true);
-      ws.onclose = () => { setConnected(false); clearTimeout(reconnectTimer); reconnectTimer = setTimeout(connectWS, 1200); };
-      ws.onerror = () => ws.close();
-      ws.onmessage = (event) => { try { updateUI(JSON.parse(event.data)); } catch (_) {} };
+    async function refreshData() {
+      try {
+        const currentRes = await fetch('/data');
+        const currentJson = await currentRes.json();
+        updateMetrics(currentJson);
+
+        const logsRes = await fetch('/logs?format=json');
+        const logsJson = await logsRes.json();
+        if (logsJson.ok) {
+          updateHistoryTable(logsJson.rows || []);
+        } else {
+          historyTableBody.innerHTML = `<tr><td colspan="5" class="muted">Erreur logs: ${logsJson.error || 'inconnue'}</td></tr>`;
+        }
+
+        setConnected(true);
+      } catch (_) {
+        setConnected(false);
+      }
     }
 
     async function setAllRelays(enabled) {
       const state = enabled ? 1 : 0;
       const res = await fetch(`/relay/all/set?state=${state}`);
-      updateUI(await res.json());
+      updateMetrics(await res.json());
     }
 
     relayAllSwitch.addEventListener('change', (e) => setAllRelays(e.target.checked));
 
-    deleteMessageBtn.addEventListener('click', async () => {
-      const res = await fetch('/sim/message/delete');
-      updateUI(await res.json());
-    });
-
-    sendSmsBtn.addEventListener('click', async () => {
-      if (!simConnected) return;
-      const action = simActionEl.value;
-      const number = smsNumberEl.value.trim();
-      if (!number) return;
-      let url = '';
-      if (action === 'call') {
-        url = `/sim/call?number=${encodeURIComponent(number)}`;
-      } else {
-        const message = smsTextEl.value.trim();
-        if (!message) return;
-        url = `/sim/sms?number=${encodeURIComponent(number)}&message=${encodeURIComponent(message)}`;
-      }
-      const res = await fetch(url);
-      const json = await res.json();
-      if (json.ok && action !== 'call') smsTextEl.value = '';
-      if (json.error) sendHintEl.textContent = json.error;
-    });
-
-    simActionEl.addEventListener('change', () => {
-      const callMode = simActionEl.value === 'call';
-      smsTextEl.style.display = callMode ? 'none' : 'block';
-      sendSmsBtn.textContent = callMode ? 'Appeler' : 'Envoyer';
-    });
-
-    connectWS();
+    refreshData();
+    setInterval(refreshData, 5000);
   </script>
 </body>
 </html>
 )rawliteral";
 
-String sanitizeJson(const String& input) {
-  String out;
-  out.reserve(input.length() + 8);
-  for (size_t i = 0; i < input.length(); i++) {
-    const char ch = input[i];
-    if (ch == '"' || ch == '\\') {
-      out += '\\';
-      out += ch;
-    } else if (ch == '\n' || ch == '\r') {
-      out += ' ';
-    } else {
-      out += ch;
+void setupWebServer() {
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send_P(200, "text/html", INDEX_HTML);
+  });
+
+  server.on("/data", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "application/json", buildCurrentJson());
+  });
+
+  server.on("/history", HTTP_GET, [](AsyncWebServerRequest* request) {
+    request->send(200, "application/json", buildHistoryJson());
+  });
+
+  server.on("/logs", HTTP_GET, [](AsyncWebServerRequest* request) {
+    const bool asJson = request->hasParam("format") && request->getParam("format")->value() == "json";
+
+    if (asJson) {
+      request->send(200, "application/json", readLogsAsJson());
+      return;
     }
-  }
-  return out;
-}
 
-String sendSimCommand(const String& cmd, uint32_t timeoutMs = 1200) {
-  while (sim800.available()) sim800.read();
-  sim800.println(cmd);
-  String response;
-  const unsigned long start = millis();
-  while (millis() - start < timeoutMs) {
-    while (sim800.available()) response += static_cast<char>(sim800.read());
-  }
-  return response;
-}
-
-void setAllRelays(bool enabled) {
-  relay1State = enabled;
-  relay2State = enabled;
-  digitalWrite(RELAY1_PIN, relay1State ? HIGH : LOW);
-  digitalWrite(RELAY2_PIN, relay2State ? HIGH : LOW);
-}
-
-void updateLatestSimMessage() {
-  const String listResp = sendSimCommand("AT+CMGL=\"ALL\"", 1500);
-  int pos = 0;
-  simMessageCount = 0;
-  int newestIdx = -1;
-  String newestFrom;
-  String newestText;
-
-  while (true) {
-    int header = listResp.indexOf("+CMGL:", pos);
-    if (header < 0) break;
-
-    int lineEnd = listResp.indexOf('\n', header);
-    if (lineEnd < 0) break;
-
-    const String meta = listResp.substring(header, lineEnd);
-    const int idxSep = meta.indexOf(':');
-    const int comma = meta.indexOf(',', idxSep + 1);
-    const int msgIndex = (idxSep >= 0 && comma > idxSep) ? meta.substring(idxSep + 1, comma).toInt() : -1;
-    const int statusQ1 = meta.indexOf('"', comma + 1);
-    const int statusQ2 = (statusQ1 >= 0) ? meta.indexOf('"', statusQ1 + 1) : -1;
-    const String status = (statusQ1 >= 0 && statusQ2 > statusQ1) ? meta.substring(statusQ1 + 1, statusQ2) : "";
-
-    const int q2 = statusQ2;
-    const int q3 = (q2 >= 0) ? meta.indexOf('"', q2 + 1) : -1;
-    const int q4 = (q3 >= 0) ? meta.indexOf('"', q3 + 1) : -1;
-    const String from = (q3 >= 0 && q4 > q3) ? meta.substring(q3 + 1, q4) : "";
-
-    int msgStart = lineEnd + 1;
-    while (msgStart < listResp.length() && (listResp[msgStart] == '\r' || listResp[msgStart] == '\n')) msgStart++;
-
-    int msgEnd = listResp.indexOf("\r\n", msgStart);
-    if (msgEnd < 0) msgEnd = listResp.indexOf('\n', msgStart);
-    if (msgEnd < 0) msgEnd = listResp.length();
-
-    const String msgText = listResp.substring(msgStart, msgEnd);
-    autoReplyInfoRequest(from, msgText, status);
-
-    if (status == "STO UNSENT" || status == "STO SENT") {
-      if (msgIndex >= 0) sendSimCommand("AT+CMGD=" + String(msgIndex), 600);
-    } else if (status == "REC UNREAD" || status == "REC READ") {
-      if (msgIndex > newestIdx) {
-        newestIdx = msgIndex;
-        newestFrom = from;
-        newestText = msgText;
-      }
-      if (simMessageCount < SIM_MESSAGE_HISTORY_SIZE) {
-        simMessageIndexes[simMessageCount] = msgIndex;
-        simMessageSenders[simMessageCount] = sanitizeJson(from);
-        simMessageTexts[simMessageCount] = sanitizeJson(msgText);
-        simMessageCount++;
-      }
+    const String logText = readLogsAsText();
+    if (logText.startsWith("error:")) {
+      request->send(500, "text/plain", logText);
+      return;
     }
-    pos = msgEnd;
-  }
+    request->send(200, "text/plain", logText);
+  });
 
-  if (newestIdx >= 0) {
-    simLastSender = sanitizeJson(newestFrom);
-    simLastMessage = sanitizeJson(newestText);
-    sendSimCommand("AT+CMGD=1,3", 700); // garde seulement le dernier SMS
-  } else {
-    simLastSender = "";
-    simLastMessage = "Aucun message";
-  }
+  server.on("/download", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (!sdReady || !SD.exists(LOG_FILE_PATH)) {
+      request->send(404, "text/plain", "log.csv non disponible");
+      return;
+    }
+    request->send(SD, LOG_FILE_PATH, "text/csv", true);
+  });
+
+  server.on("/relay/all/set", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (request->hasParam("state")) {
+      setAllRelays(request->getParam("state")->value().toInt() != 0);
+    }
+    request->send(200, "application/json", buildCurrentJson());
+  });
+
+  server.onNotFound([](AsyncWebServerRequest* request) {
+    request->send(404, "application/json", "{\"error\":\"Not found\"}");
+  });
+
+  server.begin();
 }
 
-void clearLatestSimMessage() {
-  sendSimCommand("AT+CMGD=1,4", 1000);
-  simLastSender = "";
-  simLastMessage = "Aucun message";
-  simMessageCount = 0;
-}
-
-String buildSimMessagesJson() {
-  String json = "[";
-  for (int i = static_cast<int>(simMessageCount) - 1; i >= 0; i--) {
-    json += "{\"index\":";
-    json += String(simMessageIndexes[i]);
-    json += ",\"sender\":\"";
-    json += simMessageSenders[i];
-    json += "\",\"text\":\"";
-    json += simMessageTexts[i];
-    json += "\"}";
-    if (i > 0) json += ",";
-  }
-  json += "]";
-  return json;
-}
-
-void updateSimNetworkStatus() {
-  const String regResp = sendSimCommand("AT+CREG?", 1200);
-  const bool registeredHome = regResp.indexOf("+CREG: 0,1") >= 0 || regResp.indexOf("+CREG: 1,1") >= 0;
-  const bool registeredRoaming = regResp.indexOf("+CREG: 0,5") >= 0 || regResp.indexOf("+CREG: 1,5") >= 0;
-  simNetworkConnected = registeredHome || registeredRoaming;
-  simNetworkStatus = simNetworkConnected ? "Connecte au reseau" : "Non connecte au reseau";
-}
-
-void initSim800() {
-  sim800.begin(9600, SERIAL_8N1, SIM800_RX_PIN, SIM800_TX_PIN);
-  sendSimCommand("AT");
-  sendSimCommand("ATE0");
-  sendSimCommand("AT+CMGF=1");
-  sendSimCommand("AT+CPMS=\"SM\",\"SM\",\"SM\"");
-  sendSimCommand("AT+CNMI=1,1,0,0,0");
-  updateSimNetworkStatus();
-  updateLatestSimMessage();
-}
-
-void simSendSms(const String& number, const String& message) {
-  sendSimCommand("AT+CMGF=1");
-  sendSimCommand("AT+CMGS=\"" + number + "\"");
-  sim800.print(message);
-  sim800.write(26);
-}
-
-void simCallNumber(const String& number) {
-  sendSimCommand("ATD" + number + ";", 800);
-}
-
-String getDateTimeString() {
-  if (!rtcAvailable) return "00/00/0000 00:00:00";
-  DateTime now = rtc.now();
-  char buffer[20];
-  snprintf(buffer, sizeof(buffer), "%02d/%02d/%04d %02d:%02d:%02d",
-           now.day(), now.month(), now.year(), now.hour(), now.minute(), now.second());
-  return String(buffer);
-}
-
-String getTimeString() {
-  if (!rtcAvailable) return "00:00:00";
-  DateTime now = rtc.now();
-  char buffer[9];
-  snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d", now.hour(), now.minute(), now.second());
-  return String(buffer);
-}
-
-void autoReplyInfoRequest(const String& sender, const String& messageText, const String& status) {
-  if (status != "REC UNREAD") return;
-  String normalized = messageText;
-  normalized.trim();
-  normalized.toUpperCase();
-  if (normalized != "INFO") return;
-  if (sender.length() == 0) return;
-
-  const String response = "Information ce " + getDateTimeString() +
-                          "\nTension: " + String(lastVoltage, 2) + " V" +
-                          ",Courant:" + String(lastCurrent, 3) + " A" +
-                          ",Power:" + String(lastPower, 1) + " W" +
-                          ",Conso Totale:" + String(lastEnergy, 3) + " kWh";
-  simSendSms(sender, response);
-}
-
-void readSensors() {
-  float v = pzem.voltage();
-  float c = pzem.current();
-  float p = pzem.power();
-  float e = pzem.energy();
-
-  if (!isnan(v)) lastVoltage = v;
-  if (!isnan(c)) lastCurrent = c;
-  if (!isnan(p)) lastPower = p;
-  if (!isnan(e)) lastEnergy = e;
-
-  String t = getTimeString();
-  t.toCharArray(lastTime, sizeof(lastTime));
-}
-
-String buildCurrentJson() {
-  const String safeMsg = sanitizeJson(simLastMessage);
-  const String safeFrom = sanitizeJson(simLastSender);
-  String payload = "{";
-  payload += "\"voltage\":" + String(lastVoltage, 2);
-  payload += ",\"current\":" + String(lastCurrent, 3);
-  payload += ",\"power\":" + String(lastPower, 1);
-  payload += ",\"energy\":" + String(lastEnergy, 3);
-  payload += ",\"time\":\"" + String(lastTime) + "\"";
-  payload += ",\"relay1\":";
-  payload += (relay1State ? "true" : "false");
-  payload += ",\"relay2\":";
-  payload += (relay2State ? "true" : "false");
-  payload += ",\"simLastMessage\":\"" + safeMsg + "\"";
-  payload += ",\"simLastSender\":\"" + safeFrom + "\"";
-  payload += ",\"simNetworkConnected\":";
-  payload += (simNetworkConnected ? "true" : "false");
-  payload += ",\"simNetworkStatus\":\"" + sanitizeJson(simNetworkStatus) + "\"";
-  payload += ",\"simMessages\":";
-  payload += buildSimMessagesJson();
-  payload += "}";
-  return payload;
-}
-
-void pushHistory(float v, float c, float p, float e, const char* t) {
-  Sample s{v, c, p, e, ""};
-  strlcpy(s.timeStr, t, sizeof(s.timeStr));
-  historyBuffer[historyHead] = s;
-  historyHead = (historyHead + 1) % HISTORY_SIZE;
-  if (historyCount < HISTORY_SIZE) historyCount++;
-}
-
-String buildHistoryJson() {
-  String json = "[";
-  for (size_t i = 0; i < historyCount; i++) {
-    size_t idx = (historyHead + HISTORY_SIZE - historyCount + i) % HISTORY_SIZE;
-    const Sample& s = historyBuffer[idx];
-    char row[170];
-    snprintf(row, sizeof(row), "{\"voltage\":%.2f,\"current\":%.3f,\"power\":%.1f,\"energy\":%.3f,\"time\":\"%s\"}", s.voltage, s.current, s.power, s.energy, s.timeStr);
-    json += row;
-    if (i + 1 < historyCount) json += ",";
-  }
-  json += "]";
-  return json;
-}
-
-void notifyClients() { ws.textAll(buildCurrentJson()); }
-
-void onWsEvent(AsyncWebSocket* wsServer, AsyncWebSocketClient* client, AwsEventType type,
-               void* arg, uint8_t* data, size_t len) {
-  (void)wsServer;
-  (void)arg;
-  (void)data;
-  (void)len;
-  if (type == WS_EVT_CONNECT) client->text(buildCurrentJson());
-}
-
+// ---------------------------
+// Setup / Loop
+// ---------------------------
 void setup() {
   Serial.begin(115200);
   delay(200);
@@ -560,7 +549,7 @@ void setup() {
   Wire.begin(I2C_SDA_PIN, I2C_SCL_PIN);
   rtcAvailable = rtc.begin();
   if (!rtcAvailable) {
-    Serial.println("[RTC] DS3231 non detecte");
+    Serial.println("[RTC] DS3231 non detecte, fallback millis");
   } else if (rtc.lostPower()) {
     rtc.adjust(DateTime(F(__DATE__), F(__TIME__)));
   }
@@ -570,7 +559,7 @@ void setup() {
   pinMode(RELAY2_PIN, OUTPUT);
   setAllRelays(false);
 
-  initSim800();
+  initSdCard();
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(localIP, gateway, subnet);
@@ -579,73 +568,26 @@ void setup() {
   Serial.printf("[WiFi] AP actif: %s\n", AP_SSID);
   Serial.printf("[WiFi] IP locale: %s\n", WiFi.softAPIP().toString().c_str());
 
-  ws.onEvent(onWsEvent);
-  server.addHandler(&ws);
-
-  server.on("/", HTTP_GET, [](AsyncWebServerRequest* request) { request->send_P(200, "text/html", INDEX_HTML); });
-  server.on("/data", HTTP_GET, [](AsyncWebServerRequest* request) { request->send(200, "application/json", buildCurrentJson()); });
-  server.on("/history", HTTP_GET, [](AsyncWebServerRequest* request) { request->send(200, "application/json", buildHistoryJson()); });
-
-  server.on("/relay/all/set", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (request->hasParam("state")) setAllRelays(request->getParam("state")->value().toInt() != 0);
-    request->send(200, "application/json", buildCurrentJson());
-  });
-
-  server.on("/sim/status", HTTP_GET, [](AsyncWebServerRequest* request) {
-    updateSimNetworkStatus();
-    updateLatestSimMessage();
-    request->send(200, "application/json", buildCurrentJson());
-  });
-
-  server.on("/sim/call", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (request->hasParam("number")) simCallNumber(request->getParam("number")->value());
-    request->send(200, "application/json", "{\"ok\":true}");
-  });
-
-  server.on("/sim/sms", HTTP_GET, [](AsyncWebServerRequest* request) {
-    updateSimNetworkStatus();
-    if (!simNetworkConnected) {
-      request->send(409, "application/json", "{\"ok\":false,\"error\":\"Reseau non connecte\"}");
-      return;
-    }
-    if (request->hasParam("number") && request->hasParam("message")) {
-      simSendSms(request->getParam("number")->value(), request->getParam("message")->value());
-    }
-    request->send(200, "application/json", "{\"ok\":true}");
-  });
-
-  server.on("/sim/message/delete", HTTP_GET, [](AsyncWebServerRequest* request) {
-    if (request->hasParam("index")) {
-      const int idx = request->getParam("index")->value().toInt();
-      if (idx > 0) sendSimCommand("AT+CMGD=" + String(idx), 800);
-      updateLatestSimMessage();
-    } else {
-      clearLatestSimMessage();
-    }
-    request->send(200, "application/json", buildCurrentJson());
-  });
-
-  server.onNotFound([](AsyncWebServerRequest* request) { request->send(404, "application/json", "{\"error\":\"Not found\"}"); });
-
-  server.begin();
+  setupWebServer();
 }
 
 void loop() {
   const unsigned long nowMs = millis();
 
-  if (nowMs - lastSampleMs >= SAMPLE_INTERVAL_MS) {
-    lastSampleMs = nowMs;
-    readSensors();
-    pushHistory(lastVoltage, lastCurrent, lastPower, lastEnergy, lastTime);
-    notifyClients();
+  if (nowMs - lastSensorMs >= SENSOR_INTERVAL_MS) {
+    lastSensorMs = nowMs;
+    readPzemData();
+    pushHistorySample(getDateTimeString(), lastVoltage, lastCurrent, lastPower, lastEnergy);
   }
 
-  if (nowMs - lastSimPollMs >= SIM_POLL_INTERVAL_MS) {
-    lastSimPollMs = nowMs;
-    updateSimNetworkStatus();
-    updateLatestSimMessage();
-    notifyClients();
+  if (nowMs - lastLogMs >= LOG_INTERVAL_MS) {
+    lastLogMs = nowMs;
+    const String dt = getDateTimeString();
+    if (!appendLogLine(dt, lastVoltage, lastCurrent, lastPower, lastEnergy)) {
+      // Retry SD init if card was removed/inserted at runtime
+      if (!sdReady) {
+        initSdCard();
+      }
+    }
   }
-
-  ws.cleanupClients();
 }
