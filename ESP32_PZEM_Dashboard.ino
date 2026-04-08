@@ -594,27 +594,41 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     function parseCsvLogs(csvText) {
       const lines = csvText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
       if (lines.length <= 1) {
-        return { labels: [], values: [] };
+        return { rows: [], labels: [], voltages: [], powers: [] };
       }
 
+      const rows = [];
       const labels = [];
-      const values = [];
+      const voltages = [];
+      const powers = [];
 
       for (let i = 1; i < lines.length; i++) {
         const parts = lines[i].split(',');
         if (parts.length < 5) continue;
-        labels.push(parts[0]);
-        values.push(Number(parts[1]));
+        const date = parts[0];
+        const voltage = Number(parts[1]);
+        const current = Number(parts[2]);
+        const power = Number(parts[3]);
+        const energy = Number(parts[4]);
+        if (!Number.isFinite(voltage) || !Number.isFinite(power)) continue;
+
+        rows.push({ date, voltage, current, power, energy });
+        labels.push(date);
+        voltages.push(voltage);
+        powers.push(power);
       }
 
       const maxPoints = 120;
       if (labels.length > maxPoints) {
+        const offset = labels.length - maxPoints;
         return {
+          rows: rows.slice(offset),
           labels: labels.slice(labels.length - maxPoints),
-          values: values.slice(values.length - maxPoints)
+          voltages: voltages.slice(voltages.length - maxPoints),
+          powers: powers.slice(powers.length - maxPoints)
         };
       }
-      return { labels, values };
+      return { rows, labels, voltages, powers };
     }
 
     function updateChart(labels, values) {
@@ -657,42 +671,31 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       powerChart.update('none');
     }
 
-    async function refreshChart() {
-      try {
-        const logsRes = await fetch('/logs');
-        if (!logsRes.ok) throw new Error('logs_unavailable');
-        const csv = await logsRes.text();
-        const parsed = parseCsvLogs(csv);
-
-        if (!parsed.labels.length) {
-          sdStatus.textContent = 'Statut SD: fichier log.csv vide ou sans données';
-        }
-        updateChart(parsed.labels, parsed.values);
-      } catch (_) {
-        sdStatus.textContent = 'Statut SD: lecture /logs impossible (carte absente ou erreur)';
-      }
-    }
-
     async function refreshData() {
       try {
-        const currentRes = await fetch('/data');
+        const [currentRes, logsRes] = await Promise.all([fetch('/data'), fetch('/logs')]);
+        if (!currentRes.ok) throw new Error('data_fetch_failed');
         const currentJson = await currentRes.json();
         updateMetrics(currentJson);
 
-        const logsRes = await fetch('/logs?format=json');
-        const logsJson = await logsRes.json();
-        if (logsJson.ok) {
-          updateHistoryTable(logsJson.rows || []);
+        if (logsRes.ok) {
+          const csv = await logsRes.text();
+          const parsed = parseCsvLogs(csv);
+          updateHistoryTable(parsed.rows);
+          updateChart(parsed.labels, parsed.voltages);
+          if (!parsed.labels.length) {
+            sdStatus.textContent = 'Statut SD: fichier log.csv vide ou sans données';
+          }
         } else {
-          historyTableBody.innerHTML = `<tr><td colspan="5" class="muted">Erreur logs: ${logsJson.error || 'inconnue'}</td></tr>`;
+          historyTableBody.innerHTML = '<tr><td colspan="5" class="muted">Erreur logs: lecture /logs impossible</td></tr>';
+          sdStatus.textContent = 'Statut SD: lecture /logs impossible (carte absente ou erreur)';
         }
 
         setConnected(true);
       } catch (_) {
         setConnected(false);
+        sdStatus.textContent = 'Statut SD: communication ESP32 indisponible';
       }
-
-      await refreshChart();
     }
 
     async function setAllRelays(enabled) {
