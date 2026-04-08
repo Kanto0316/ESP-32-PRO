@@ -210,6 +210,112 @@ bool ensureLogFile() {
   return true;
 }
 
+size_t countCsvColumns(const String& line) {
+  if (line.length() == 0) {
+    return 0;
+  }
+  size_t columns = 1;
+  for (size_t i = 0; i < line.length(); i++) {
+    if (line[i] == ',') {
+      columns++;
+    }
+  }
+  return columns;
+}
+
+bool isValidLogDataLine(const String& line) {
+  if (line.length() == 0 || countCsvColumns(line) != 5) {
+    return false;
+  }
+
+  int p1 = line.indexOf(',');
+  int p2 = line.indexOf(',', p1 + 1);
+  int p3 = line.indexOf(',', p2 + 1);
+  int p4 = line.indexOf(',', p3 + 1);
+  if (p1 <= 0 || p2 <= p1 + 1 || p3 <= p2 + 1 || p4 <= p3 + 1 || p4 >= static_cast<int>(line.length() - 1)) {
+    return false;
+  }
+
+  const String voltage = line.substring(p1 + 1, p2);
+  const String current = line.substring(p2 + 1, p3);
+  const String power = line.substring(p3 + 1, p4);
+  const String energy = line.substring(p4 + 1);
+  auto isNumeric = [](const String& value) {
+    if (value.length() == 0) {
+      return false;
+    }
+    char buffer[24];
+    value.toCharArray(buffer, sizeof(buffer));
+    char* endPtr = nullptr;
+    strtof(buffer, &endPtr);
+    return endPtr != buffer && *endPtr == '\0';
+  };
+
+  return isNumeric(voltage) && isNumeric(current) && isNumeric(power) && isNumeric(energy);
+}
+
+void verifyAndRepairLogFile() {
+  if (!sdReady || !ensureLogFile()) {
+    return;
+  }
+
+  File source = SD.open(LOG_FILE_PATH, FILE_READ);
+  if (!source) {
+    Serial.println("[SD] Erreur: impossible d'ouvrir log.csv pour verification");
+    return;
+  }
+
+  constexpr const char* TMP_LOG_FILE_PATH = "/log_tmp.csv";
+  File target = SD.open(TMP_LOG_FILE_PATH, FILE_WRITE);
+  if (!target) {
+    Serial.println("[SD] Erreur: impossible de creer le fichier temporaire");
+    source.close();
+    return;
+  }
+
+  target.println("date,voltage,current,power,energy");
+
+  size_t validLines = 0;
+  size_t droppedLines = 0;
+  bool headerProcessed = false;
+  while (source.available()) {
+    String line = source.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) {
+      continue;
+    }
+
+    if (!headerProcessed) {
+      headerProcessed = true;
+      if (line.equalsIgnoreCase("date,voltage,current,power,energy")) {
+        continue;
+      }
+    }
+
+    if (isValidLogDataLine(line)) {
+      target.println(line);
+      validLines++;
+    } else {
+      droppedLines++;
+      Serial.printf("[SD] Ligne ignoree/corrompue: %s\n", line.c_str());
+    }
+  }
+
+  target.flush();
+  target.close();
+  source.close();
+
+  SD.remove(LOG_FILE_PATH);
+  if (!SD.rename(TMP_LOG_FILE_PATH, LOG_FILE_PATH)) {
+    Serial.println("[SD] Erreur: impossible de remplacer log.csv apres verification");
+    return;
+  }
+
+  Serial.printf("[SD] Verification log.csv terminee: %u lignes valides, %u supprimees\n",
+                static_cast<unsigned int>(validLines),
+                static_cast<unsigned int>(droppedLines));
+}
+
 void initSdCard() {
   sdSpi.begin(SD_SCK_PIN, SD_MISO_PIN, SD_MOSI_PIN, SD_CS_PIN);
   sdReady = SD.begin(SD_CS_PIN, sdSpi);
@@ -219,6 +325,7 @@ void initSdCard() {
   }
   Serial.println("[SD] Carte SD initialisee");
   ensureLogFile();
+  verifyAndRepairLogFile();
 }
 
 void initSpiffs() {
@@ -230,11 +337,13 @@ void initSpiffs() {
   Serial.println("[SPIFFS] Initialisee");
 }
 
-bool appendLogLine(const String& dateTime, float v, float c, float p, float e) {
+bool saveToSD(String dataLine) {
   if (!sdReady) {
+    Serial.println("[SD] Erreur: carte SD non disponible");
     return false;
   }
   if (!ensureLogFile()) {
+    Serial.println("[SD] Erreur: log.csv indisponible");
     return false;
   }
 
@@ -244,9 +353,8 @@ bool appendLogLine(const String& dateTime, float v, float c, float p, float e) {
     return false;
   }
 
-  char line[128];
-  snprintf(line, sizeof(line), "%s,%.2f,%.3f,%.1f,%.3f", dateTime.c_str(), v, c, p, e);
-  file.println(line);
+  file.println(dataLine);
+  file.flush();
   file.close();
   return true;
 }
@@ -714,7 +822,9 @@ void loop() {
   if (nowMs - lastLogMs >= LOG_INTERVAL_MS) {
     lastLogMs = nowMs;
     const String dt = getDateTimeString();
-    if (!appendLogLine(dt, lastVoltage, lastCurrent, lastPower, lastEnergy)) {
+    char line[128];
+    snprintf(line, sizeof(line), "%s,%.2f,%.3f,%.1f,%.3f", dt.c_str(), lastVoltage, lastCurrent, lastPower, lastEnergy);
+    if (!saveToSD(String(line))) {
       // Retry SD init if card was removed/inserted at runtime
       if (!sdReady) {
         initSdCard();
