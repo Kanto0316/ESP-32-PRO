@@ -6,6 +6,8 @@
 #include <RTClib.h>
 #include <SPI.h>
 #include <SD.h>
+#include <FS.h>
+#include <SPIFFS.h>
 
 // ---------------------------
 // Configuration
@@ -30,6 +32,7 @@ constexpr uint8_t SD_MOSI_PIN = 23;
 constexpr uint8_t SD_SCK_PIN = 18;
 constexpr uint8_t SD_CS_PIN = 5;
 constexpr const char* LOG_FILE_PATH = "/log.csv";
+constexpr const char* CHART_FILE_PATH = "/chart.js";
 
 constexpr unsigned long SENSOR_INTERVAL_MS = 1000;
 constexpr unsigned long LOG_INTERVAL_MS = 5000;
@@ -45,6 +48,7 @@ SPIClass sdSpi(VSPI);
 
 bool rtcAvailable = false;
 bool sdReady = false;
+bool spiffsReady = false;
 bool relay1State = false;
 bool relay2State = false;
 
@@ -217,6 +221,15 @@ void initSdCard() {
   ensureLogFile();
 }
 
+void initSpiffs() {
+  spiffsReady = SPIFFS.begin(true);
+  if (!spiffsReady) {
+    Serial.println("[SPIFFS] Initialisation echouee");
+    return;
+  }
+  Serial.println("[SPIFFS] Initialisee");
+}
+
 bool appendLogLine(const String& dateTime, float v, float c, float p, float e) {
   if (!sdReady) {
     return false;
@@ -357,6 +370,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     table { width:100%; border-collapse:collapse; font-size:.9rem; }
     th, td { padding:8px 10px; border-bottom:1px solid var(--border); text-align:left; white-space:nowrap; }
     th { position:sticky; top:0; background:#0b1220; z-index:1; }
+    .chart-wrap { position:relative; width:100%; min-height:280px; }
+    #chart { width:100%; height:300px; }
   </style>
 </head>
 <body>
@@ -407,9 +422,22 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       </div>
     </section>
 
+    <section class="card" style="margin-top:14px;">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;">
+        <div>
+          <div class="label">📈 Graphique temps réel (depuis /log.csv)</div>
+          <div class="muted">Source: route <code>/logs</code> (CSV), rafraîchissement 5 s.</div>
+        </div>
+      </div>
+      <div class="chart-wrap" style="margin-top:12px;">
+        <canvas id="chart"></canvas>
+      </div>
+    </section>
+
     <div class="footer-note">Mise à jour automatique des mesures et de l'historique toutes les 5 secondes.</div>
   </div>
 
+  <script src="/chart.js"></script>
   <script>
     const statusDot = document.getElementById('statusDot');
     const statusText = document.getElementById('statusText');
@@ -420,6 +448,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
     const relayAllSwitch = document.getElementById('relayAllSwitch');
     const historyTableBody = document.getElementById('historyTableBody');
     const sdStatus = document.getElementById('sdStatus');
+    const chartCanvas = document.getElementById('chart');
+    let powerChart = null;
 
     function setConnected(ok) {
       statusDot.classList.toggle('connected', ok);
@@ -453,6 +483,88 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       }).join('');
     }
 
+    function parseCsvLogs(csvText) {
+      const lines = csvText.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+      if (lines.length <= 1) {
+        return { labels: [], values: [] };
+      }
+
+      const labels = [];
+      const values = [];
+
+      for (let i = 1; i < lines.length; i++) {
+        const parts = lines[i].split(',');
+        if (parts.length < 5) continue;
+        labels.push(parts[0]);
+        values.push(Number(parts[1]));
+      }
+
+      const maxPoints = 120;
+      if (labels.length > maxPoints) {
+        return {
+          labels: labels.slice(labels.length - maxPoints),
+          values: values.slice(values.length - maxPoints)
+        };
+      }
+      return { labels, values };
+    }
+
+    function updateChart(labels, values) {
+      if (typeof Chart === 'undefined') {
+        sdStatus.textContent = 'Statut SD: chart.js non trouvé (placer /chart.js sur SD ou SPIFFS)';
+        return;
+      }
+
+      if (!powerChart) {
+        powerChart = new Chart(chartCanvas, {
+          type: 'line',
+          data: {
+            labels,
+            datasets: [{
+              label: 'Tension (V)',
+              data: values,
+              borderColor: '#38bdf8',
+              backgroundColor: 'rgba(56,189,248,0.18)',
+              fill: true,
+              tension: 0.22,
+              pointRadius: 0
+            }]
+          },
+          options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            scales: {
+              x: { ticks: { color: '#cbd5e1', maxTicksLimit: 8 } },
+              y: { ticks: { color: '#cbd5e1' }, title: { display: true, text: 'Volt (V)', color: '#cbd5e1' } }
+            },
+            plugins: { legend: { labels: { color: '#e2e8f0' } } }
+          }
+        });
+        return;
+      }
+
+      powerChart.data.labels = labels;
+      powerChart.data.datasets[0].data = values;
+      powerChart.update('none');
+    }
+
+    async function refreshChart() {
+      try {
+        const logsRes = await fetch('/logs');
+        if (!logsRes.ok) throw new Error('logs_unavailable');
+        const csv = await logsRes.text();
+        const parsed = parseCsvLogs(csv);
+
+        if (!parsed.labels.length) {
+          sdStatus.textContent = 'Statut SD: fichier log.csv vide ou sans données';
+        }
+        updateChart(parsed.labels, parsed.values);
+      } catch (_) {
+        sdStatus.textContent = 'Statut SD: lecture /logs impossible (carte absente ou erreur)';
+      }
+    }
+
     async function refreshData() {
       try {
         const currentRes = await fetch('/data');
@@ -471,6 +583,8 @@ const char INDEX_HTML[] PROGMEM = R"rawliteral(
       } catch (_) {
         setConnected(false);
       }
+
+      await refreshChart();
     }
 
     async function setAllRelays(enabled) {
@@ -517,6 +631,22 @@ void setupWebServer() {
     request->send(200, "text/plain", logText);
   });
 
+  server.on("/chart.js", HTTP_GET, [](AsyncWebServerRequest* request) {
+    if (sdReady && SD.exists(CHART_FILE_PATH)) {
+      request->send(SD, CHART_FILE_PATH, "application/javascript");
+      return;
+    }
+
+    if (spiffsReady && SPIFFS.exists(CHART_FILE_PATH)) {
+      request->send(SPIFFS, CHART_FILE_PATH, "application/javascript");
+      return;
+    }
+
+    request->send(404,
+                  "application/javascript",
+                  "console.error('chart.js absent: placez /chart.js sur SD ou SPIFFS');");
+  });
+
   server.on("/download", HTTP_GET, [](AsyncWebServerRequest* request) {
     if (!sdReady || !SD.exists(LOG_FILE_PATH)) {
       request->send(404, "text/plain", "log.csv non disponible");
@@ -560,6 +690,7 @@ void setup() {
   setAllRelays(false);
 
   initSdCard();
+  initSpiffs();
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(localIP, gateway, subnet);
